@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+*.db
+*.py[cod]
+ml/artifacts/*
+!ml/artifacts/.gitkeep
+ml/datasets/*
+!ml/datasets/README.md
+infra/nginx/certs/*
+*.pem
+*.key
+node_modules/
+dist/
