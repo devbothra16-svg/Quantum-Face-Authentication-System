@@ -35,8 +35,7 @@ services:
     build: {context: ./frontend, dockerfile: Dockerfile}
     depends_on: [backend]
   nginx:
-    image: nginx:1.27-alpine
+    build: {context: ./infra/nginx, dockerfile: Dockerfile}
     ports: ["80:80"]
-    volumes: ["./infra/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro", "./infra/nginx/certs:/etc/nginx/certs:ro"]
     depends_on: [frontend, backend]
 volumes: {pgdata: {}, redisdata: {}, keydata: {}}
