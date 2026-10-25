@@ -6,6 +6,8 @@ __pycache__/
 .coverage
 *.db
 *.py[cod]
+*.egg-info/
+*.tsbuildinfo
 ml/artifacts/*
 !ml/artifacts/.gitkeep
 ml/datasets/*
