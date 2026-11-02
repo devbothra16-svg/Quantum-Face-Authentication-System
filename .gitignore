@@ -17,3 +17,6 @@ infra/nginx/certs/*
 *.key
 node_modules/
 dist/
+
+# Downloaded at frontend startup; keep model weights out of Git.
+frontend/public/models/face_landmarker.task

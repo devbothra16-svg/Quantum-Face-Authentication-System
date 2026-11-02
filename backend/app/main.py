@@ -7,8 +7,10 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import inspect
 
 from app.api.routes import router
+from app.api.passkeys import router as passkey_router
 from app.core.config import settings
 from app.core.rate_limit import allow_request
 from app.db.models import Base
@@ -22,6 +24,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 app.include_router(router, prefix="/api")
+app.include_router(passkey_router, prefix="/api")
 
 
 @app.middleware("http")
@@ -37,6 +40,17 @@ async def rate_limit_requests(request: Request, call_next):
 def create_tables() -> None:
     """Create development tables; production should apply Alembic migrations."""
     Base.metadata.create_all(bind=engine)
+    # create_all doesn't add columns to an existing development database.
+    profile_columns = {
+        "full_name": "VARCHAR(120)",
+        "department": "VARCHAR(120)",
+        "employee_id": "VARCHAR(80)",
+    }
+    existing_columns = {column["name"] for column in inspect(engine).get_columns("users")}
+    with engine.begin() as connection:
+        for name, sql_type in profile_columns.items():
+            if name not in existing_columns:
+                connection.exec_driver_sql(f"ALTER TABLE users ADD COLUMN {name} {sql_type}")
     private_path = Path(settings.jwt_private_key_path)
     public_path = Path(settings.jwt_public_key_path)
     if not private_path.exists() or not public_path.exists():

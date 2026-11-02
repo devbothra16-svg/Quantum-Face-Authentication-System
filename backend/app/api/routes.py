@@ -2,35 +2,48 @@
 
 import os
 import uuid
+from typing import Annotated
 
 import numpy as np
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import select
+from pydantic import BaseModel, EmailStr, Field, StringConstraints
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.face_challenge_state import consume_face_challenge, issue_face_challenge
 from app.core.jwt import issue_token, verify_token
 from app.core.kms import LocalFileKMS
-from app.core.rate_limit import accept_nonce
 from app.core.security import cancelable_transform, decrypt_template, encrypt_template
 from app.db.models import AuditLog, Template, User
 from app.db.session import SessionLocal
 from app.services.embedding import get_embedding
-from app.services.liveness import check_liveness
+from app.services.liveness import liveness_failure_reason
 from app.services.matcher import score
 
 router = APIRouter()
+FrameData = Annotated[str, StringConstraints(max_length=400_000)]
+_GENERIC_FACE_FAILURE = (
+    "Verification failed. Check the email and enrolled face, then start a fresh scan."
+)
 
 
 class FaceRequest(BaseModel):
     """Face challenge payload; image bytes remain request-local."""
 
     email: EmailStr
-    frames: list[str] = Field(min_length=1, max_length=10)
-    nonce: str = Field(min_length=16, max_length=128)
-    challenge: str = Field(min_length=1, max_length=64)
+    full_name: str | None = Field(default=None, min_length=1, max_length=120)
+    department: str | None = Field(default=None, min_length=1, max_length=120)
+    employee_id: str | None = Field(default=None, min_length=1, max_length=80)
+    frames: list[FrameData] = Field(min_length=12, max_length=12)
+    challenge_id: str = Field(min_length=32, max_length=128)
     consent: bool = False
+
+
+class FaceChallengeRequest(BaseModel):
+    """Account identifier used to bind a short-lived camera challenge."""
+
+    email: EmailStr
 
 
 def db_session():
@@ -49,10 +62,29 @@ def _key() -> bytes:
     )
 
 
-def _accept_nonce(nonce: str) -> None:
-    """Reject nonce reuse; deployments should use Redis SET NX with TTL."""
-    if not accept_nonce(nonce):
-        raise HTTPException(409, "Challenge nonce already used")
+def _request_embedding(frames: list[str]) -> np.ndarray:
+    """Average clear center-pose embeddings, excluding the head-turn samples."""
+    if len(frames) != 12:
+        raise ValueError("The camera capture was incomplete. Start a new scan.")
+    selected = [frames[index] for index in (0, 1, 2, 9, 10, 11)]
+    embeddings = []
+    for frame in selected:
+        try:
+            embeddings.append(get_embedding(frame))
+        except (ValueError, RuntimeError):
+            continue
+    if len(embeddings) < 2:
+        raise ValueError("Could not get two clear center-face samples. Improve the lighting and try again.")
+    mean = np.mean(embeddings, axis=0)
+    norm = float(np.linalg.norm(mean))
+    if not norm or not np.isfinite(mean).all():
+        raise ValueError("Could not build a stable face match. Try again in steady lighting.")
+    return mean / norm
+
+
+def _normalized_email(email: EmailStr) -> str:
+    """Normalize account lookup and challenge binding consistently."""
+    return str(email).strip().casefold()
 
 
 def _subject(authorization: str) -> str:
@@ -70,19 +102,53 @@ def health() -> dict:
     return {"status": "ok", "quantum": settings.use_quantum}
 
 
+@router.post("/face/challenge")
+def start_face_challenge(payload: FaceChallengeRequest) -> dict:
+    """Create a one-use server challenge before capturing camera frames."""
+    try:
+        challenge_id, first_turn_sign = issue_face_challenge(_normalized_email(payload.email))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return {
+        "challenge_id": challenge_id,
+        "first_turn_sign": first_turn_sign,
+        "expires_in_seconds": 120,
+    }
+
+
 @router.post("/enroll")
 def enroll(payload: FaceRequest, db: Session = Depends(db_session)) -> dict:
     """Enroll from liveness-checked frames; never persist input frames."""
     if not payload.consent:
         raise HTTPException(400, "Explicit biometric consent is required")
-    _accept_nonce(payload.nonce)
-    if not check_liveness(payload.frames, payload.challenge):
-        raise HTTPException(400, "Liveness check failed")
-    embedding = np.mean([get_embedding(frame) for frame in payload.frames], axis=0)
-    user = db.scalar(select(User).where(User.email == payload.email))
+    email = _normalized_email(payload.email)
+    full_name = (payload.full_name or "").strip()
+    department = (payload.department or "").strip()
+    employee_id = (payload.employee_id or "").strip()
+    if not full_name or not department or not employee_id:
+        raise HTTPException(422, "Name, department, and employee ID are required")
+    try:
+        first_turn_sign = consume_face_challenge(payload.challenge_id, email)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    liveness_error = liveness_failure_reason(payload.frames, first_turn_sign)
+    if liveness_error:
+        raise HTTPException(400, liveness_error)
+    try:
+        embedding = _request_embedding(payload.frames)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    user = db.scalar(select(User).where(func.lower(User.email) == email))
+    if user is not None and db.get(Template, user.id) is not None:
+        raise HTTPException(409, "This account already has a registered face")
     if user is None:
-        user = User(id=str(uuid.uuid4()), email=str(payload.email))
+        user = User(id=str(uuid.uuid4()), email=email)
         db.add(user)
+    user.full_name = full_name
+    user.department = department
+    user.employee_id = employee_id
     db.flush()
     transform_secret = os.urandom(32)
     protected = cancelable_transform(embedding, transform_secret)
@@ -95,29 +161,52 @@ def enroll(payload: FaceRequest, db: Session = Depends(db_session)) -> dict:
     )
     db.add(AuditLog(user_id=user.id, event="enroll", outcome="success"))
     db.commit()
-    return {"user_id": user.id, "status": "enrolled"}
+    return {
+        "user_id": user.id,
+        "status": "enrolled",
+        "access_token": issue_token(
+            user.id, settings.jwt_private_key_path, settings.access_token_minutes
+        ),
+        "token_type": "bearer",
+    }
 
 
 @router.post("/auth")
 def authenticate(payload: FaceRequest, db: Session = Depends(db_session)) -> dict:
     """Authenticate, audit, and issue a short-lived token."""
-    _accept_nonce(payload.nonce)
-    if not check_liveness(payload.frames, payload.challenge):
-        raise HTTPException(401, "Liveness check failed")
-    user = db.scalar(select(User).where(User.email == payload.email))
+    email = _normalized_email(payload.email)
+    try:
+        first_turn_sign = consume_face_challenge(payload.challenge_id, email)
+    except ValueError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    liveness_error = liveness_failure_reason(payload.frames, first_turn_sign)
+    if liveness_error:
+        raise HTTPException(401, liveness_error)
+    user = db.scalar(select(User).where(func.lower(User.email) == email))
     template = db.get(Template, user.id) if user else None
     if user is None or template is None:
-        raise HTTPException(401, "Authentication failed")
-    embedding = np.mean([get_embedding(frame) for frame in payload.frames], axis=0)
+        raise HTTPException(401, _GENERIC_FACE_FAILURE)
+    try:
+        embedding = _request_embedding(payload.frames)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            401,
+            _GENERIC_FACE_FAILURE,
+        ) from exc
     transform_secret = decrypt_template(template.transform_secret, _key())
     protected = cancelable_transform(embedding, transform_secret)
     stored = np.frombuffer(decrypt_template(template.ciphertext, _key()), dtype=np.float32)
     similarity = score(protected, stored)
-    outcome = "success" if similarity >= 0.72 else "failure"
+    outcome = "success" if similarity >= settings.face_match_threshold else "failure"
     db.add(AuditLog(user_id=user.id, event="authenticate", outcome=outcome))
     db.commit()
     if outcome == "failure":
-        raise HTTPException(401, "Authentication failed")
+        raise HTTPException(
+            401,
+            _GENERIC_FACE_FAILURE,
+        )
     return {
         "access_token": issue_token(
             user.id, settings.jwt_private_key_path, settings.access_token_minutes
@@ -143,6 +232,29 @@ def me(authorization: str = Header(...), db: Session = Depends(db_session)) -> d
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             }
             for r in rows
+        ],
+    }
+
+
+@router.get("/vault")
+def protected_vault(authorization: str = Header(...)) -> dict:
+    """Return clearly fictional sample records only to a valid signed-in session."""
+    user_id = _subject(authorization)
+    return {
+        "owner": user_id,
+        "records": [
+            {
+                "id": "sample-001",
+                "classification": "CONFIDENTIAL · SAMPLE",
+                "title": "Quarterly access review",
+                "summary": "Demo record showing how a protected workspace can be gated.",
+            },
+            {
+                "id": "sample-002",
+                "classification": "INTERNAL · SAMPLE",
+                "title": "Incident response runbook",
+                "summary": "Fictional content for demonstrating authenticated access only.",
+            },
         ],
     }
 

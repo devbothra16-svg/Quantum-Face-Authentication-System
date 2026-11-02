@@ -25,17 +25,20 @@ services:
       KMS_KEY_PATH: /data/template.key
       JWT_PRIVATE_KEY_PATH: /data/jwt_private.pem
       JWT_PUBLIC_KEY_PATH: /data/jwt_public.pem
-      CORS_ORIGINS: http://localhost
+      CORS_ORIGINS: http://localhost:5173,http://localhost
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-localhost}
+      WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME:-Identity Access Demo}
+      WEBAUTHN_ORIGIN: ${WEBAUTHN_ORIGIN:-http://localhost:5173}
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_started}
     volumes: ["keydata:/data"]
-    ports: ["8000:8000"]
+    ports: ["127.0.0.1:8000:8000"]
   frontend:
     build: {context: ./frontend, dockerfile: Dockerfile}
     depends_on: [backend]
   nginx:
     build: {context: ./infra/nginx, dockerfile: Dockerfile}
-    ports: ["80:80"]
+    ports: ["127.0.0.1:80:80", "127.0.0.1:5173:80", "127.0.0.1:443:443"]
     depends_on: [frontend, backend]
 volumes: {pgdata: {}, redisdata: {}, keydata: {}}
